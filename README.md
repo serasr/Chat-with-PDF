@@ -64,20 +64,21 @@ It uses the official `Gradio` SDK with version control via `sdk_version`.
 Deployment config is set using [YAML front matter](https://huggingface.co/docs/hub/spaces-overview#managing-your-space) at the top of this `README.md`:
 
 ## Deploy to Hugging Face Spaces
-
+```bash
 --> Create a new Space (SDK: Gradio)
 --> Upload all project files (especially app.py, requirements.txt, README.md)
 --> Done! Your app is live at: https://huggingface.co/spaces/<your-name>/<space-name>
+```
 
 ## Roadmap
-
+```bash
 --> Add multi-PDF support
 --> Cache embeddings for re-use
 --> Highlight source text in answers
 --> Add feedback & ratings to responses
 --> Export chat history (Markdown / PDF)
 --> Add multilingual PDF support
-
+```
 ## Contributing
 
 This is the first version and designed to evolve. PRs and discussions are welcome!
