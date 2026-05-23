@@ -27,26 +27,32 @@ def load_pdf(file_path: str) -> str:
     return text
 
 
+# ── Load embedding model ONCE at startup ──────────────────────────────────────
+# This runs when chain.py is first imported, not on every PDF upload
+# Saves 8-10 seconds per upload
+print("Loading embedding model...")
+EMBEDDINGS = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+print("Embedding model ready.")
+
+
 def build_chain(file_path):
 
     # ── Step 1: Load PDF ──────────────────────────────────────────────────────
-    # CHANGED: was PyPDFLoader, now uses fitz for better column handling
     raw_text = load_pdf(file_path)
 
     # ── Step 2: Chunk ─────────────────────────────────────────────────────────
-    # CHANGED: create_documents() takes raw text instead of Document objects
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=200,
         separators=["\n\n", "\n", ".", " "]
     )
-    docs = splitter.create_documents([raw_text])  # ← changed from split_documents
+    docs = splitter.create_documents([raw_text])
 
     # ── Step 3: Embed and store ───────────────────────────────────────────────
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    vectorstore = FAISS.from_documents(docs, embeddings)
+    # CHANGED: uses the pre-loaded EMBEDDINGS instead of creating a new one
+    vectorstore = FAISS.from_documents(docs, EMBEDDINGS)
     retriever   = vectorstore.as_retriever(search_kwargs={"k": 8})
 
     # ── Step 4: LLM ───────────────────────────────────────────────────────────
