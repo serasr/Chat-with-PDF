@@ -1,5 +1,5 @@
 import gradio as gr
-from chains import build_chain
+from chain import build_chain
 import utils
 
 def process_pdf(file):
@@ -10,32 +10,31 @@ def process_pdf(file):
     utils.pdf_loaded = True
     return "PDF loaded successfully! You can now ask questions."
 
-def chat_with_pdf(user_input):
+def chat_with_pdf(user_input, history):
     if not utils.pdf_loaded or utils.qa_chain is None:
-        return utils.chat_history, "Load a PDF first."
-    result = utils.qa_chain.invoke({"question": user_input})
-    answer = result['answer']
-    sources = "\n\n Sources:\n" + "\n".join(
-        f"🔹 {doc.page_content[:200]}..." for doc in result['source_documents']
-    )
-    utils.chat_history.append((user_input, answer + sources))
-    return utils.chat_history, ""
+        return history, "Load a PDF first."
+    answer = utils.qa_chain.invoke(user_input)
+    history = history + [[user_input, answer]]
+    return history, ""
 
 def launch_app():
     with gr.Blocks() as demo:
-        gr.Markdown("## Chat with your PDF (LangChain + HuggingFace + Gradio)")
+        gr.Markdown("## Chat with your PDF")
 
         with gr.Column():
-            file = gr.File(label="Upload PDF", file_types=[".pdf"])
+            file        = gr.File(label="Upload PDF", file_types=[".pdf"])
             load_button = gr.Button("Load PDF")
-            status = gr.Textbox(label="Status", interactive=False)
+            status      = gr.Textbox(label="Status", interactive=False)
 
-        chatbot = gr.Chatbot()
-        with gr.Row():
-            user_input = gr.Textbox(placeholder="Ask a question...", scale=4)
-            send_button = gr.Button("Send", scale=1)
+        chatbot    = gr.Chatbot()
+        user_input = gr.Textbox(placeholder="Ask a question...")
+        send_btn   = gr.Button("Send")
 
-        load_button.click(process_pdf, inputs=file, outputs=status, scroll_to_output=False)
-        send_button.click(chat_with_pdf, inputs=user_input, outputs=[chatbot, user_input], scroll_to_output=False)
+        load_button.click(process_pdf, inputs=file, outputs=status)
+        send_btn.click(
+            chat_with_pdf,
+            inputs=[user_input, chatbot],
+            outputs=[chatbot, user_input]
+        )
 
-    demo.launch()
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
