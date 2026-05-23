@@ -1,5 +1,5 @@
 import gradio as gr
-from chain import build_chain
+from chain import build_chain, traced_query
 import utils
 
 def process_pdf(file):
@@ -14,7 +14,8 @@ def chat_with_pdf(user_input, history):
     if not utils.pdf_loaded or utils.qa_chain is None:
         return history, "Load a PDF first."
 
-    answer = utils.qa_chain.invoke(user_input)
+    answer = traced_query(utils.qa_chain, user_input)  # ← was chain.invoke
+
     history = history + [[user_input, answer]]
     return history, ""
 
