@@ -13,6 +13,7 @@ def process_pdf(file):
 def chat_with_pdf(user_input, history):
     if not utils.pdf_loaded or utils.qa_chain is None:
         return history, "Load a PDF first."
+
     answer = utils.qa_chain.invoke(user_input)
     history = history + [[user_input, answer]]
     return history, ""
