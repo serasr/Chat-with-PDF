@@ -11,7 +11,11 @@ from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 import fitz  # ← NEW: pymupdf, better PDF reader than PyPDFLoader
-from tracer import Trace
+from tracer import Trace, classify_error, ErrorType
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+RETRIEVAL_SCORE_THRESHOLD = 1.8  # FAISS L2 distance - above this = poor match
+MIN_CHUNKS_REQUIRED       = 1    # if we get 0 chunks, don't call the LLM
 
 load_dotenv()
 
@@ -43,6 +47,13 @@ def build_chain(file_path):
     # ── Step 1: Load PDF ──────────────────────────────────────────────────────
     raw_text = load_pdf(file_path)
 
+    # ── Check: did we get any text? ───────────────────────────────────────────
+    if not raw_text or len(raw_text.strip()) < 100:
+        raise ValueError(
+            "empty_document: PDF has no extractable text. "
+            "It may be a scanned image. Try a text-based PDF."
+        )
+
     # ── Step 2: Chunk ─────────────────────────────────────────────────────────
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
@@ -66,8 +77,8 @@ def build_chain(file_path):
     # FIXED: removed the stray "s" at the end of the prompt
     prompt = ChatPromptTemplate.from_template("""
 You are a helpful research assistant analyzing an academic paper.
-Use ONLY the context below to answer. If the context does not contain
-enough information, say "The retrieved sections don't contain this information."
+Use the context below to answer the question as best you can.
+If the context is insufficient, say what you do know and note the limitation.
 
 Context:
 {context}
@@ -99,9 +110,13 @@ Answer:
 
 def traced_query(chain, query: str) -> str:
     """
-    Run the chain with full tracing.
-    Measures retrieval and LLM latency separately.
-    Logs everything to logs/traces.jsonl and logs/traces.db
+    Run the chain with full tracing and error classification.
+
+    Error handling flow:
+    1. Check if retrieval found anything useful
+    2. If retrieval failed → return early, don't waste an LLM call
+    3. If LLM fails → classify the error, log it, return friendly message
+    4. All errors go to the tracer with classification
     """
     trace = Trace(query)
 
@@ -111,20 +126,64 @@ def traced_query(chain, query: str) -> str:
             docs_with_scores = chain._vectorstore.similarity_search_with_score(
                 query, k=8
             )
-            r_span.metadata["chunks_retrieved"] = len(docs_with_scores)
-            r_span.metadata["top_score"] = (
-                round(float(docs_with_scores[0][1]), 4)
-                if docs_with_scores else None
-            )
+            chunks_retrieved = len(docs_with_scores)
+            top_score = round(float(docs_with_scores[0][1]), 4) if docs_with_scores else None
 
-        # ── Span 2: full chain (retrieval + LLM) ──────────────────────────
+            r_span.metadata["chunks_retrieved"] = chunks_retrieved
+            r_span.metadata["top_score"]        = top_score
+
+        # ── Check 1: did retrieval find anything? ─────────────────────────
+        if chunks_retrieved < MIN_CHUNKS_REQUIRED:
+            msg = "I couldn't find any relevant sections in the document for your question."
+            trace.finish(
+                answer     = msg,
+                error      = "retrieval returned 0 chunks",
+                error_type = ErrorType.RETRIEVAL_FAILURE
+            )
+            return msg
+
+        # ── Check 2: are the chunks relevant enough? ──────────────────────────
+        if top_score and top_score > RETRIEVAL_SCORE_THRESHOLD:
+            msg = "Your question doesn't seem related to the document. Please ask something about the uploaded PDF."
+            print(f"  [WARN] Low retrieval score: {top_score} — blocking LLM call")
+            trace.finish(
+                answer     = msg,
+                error      = f"low retrieval score: {top_score}",
+                error_type = ErrorType.RETRIEVAL_FAILURE
+            )
+            return msg
+
+        # ── Span 2: LLM call ──────────────────────────────────────────────
         with trace.span("llm") as llm_span:
             answer = chain.invoke(query)
+
+            # ── Check 3: did the LLM return anything? ─────────────────────
+            if not answer or len(answer.strip()) == 0:
+                raise ValueError("LLM returned empty response")
+
             llm_span.metadata["token_estimate"] = len(answer) // 4
 
         trace.finish(answer=answer)
         return answer
 
+    except ValueError as e:
+        error_type = ErrorType.LLM_FAILURE
+        msg        = "The model returned an empty response. Please try again."
+        trace.finish(error=str(e), error_type=error_type)
+        return msg
+
     except Exception as e:
-        trace.finish(error=str(e))
-        raise
+        error_type = classify_error(e)
+        print(f"\n  [ERROR] {error_type}: {str(e)}")
+
+        # Friendly messages per error type
+        messages = {
+            ErrorType.API_ERROR:    "The AI service is temporarily unavailable. Please try again in a moment.",
+            ErrorType.LLM_FAILURE:  "The model took too long to respond. Please try again.",
+            ErrorType.EMPTY_DOCUMENT: "The document appears to have no readable text.",
+            ErrorType.UNKNOWN:      "Something went wrong. Please try again.",
+        }
+
+        msg = messages.get(error_type, messages[ErrorType.UNKNOWN])
+        trace.finish(error=str(e), error_type=error_type)
+        return msg

@@ -5,10 +5,17 @@ import utils
 def process_pdf(file):
     if file is None:
         return "Please upload a PDF first."
-    utils.qa_chain = build_chain(file.name)
-    utils.chat_history.clear()
-    utils.pdf_loaded = True
-    return "PDF loaded successfully! You can now ask questions."
+    try:
+        utils.qa_chain = build_chain(file.name)
+        utils.chat_history.clear()
+        utils.pdf_loaded = True
+        return "PDF loaded successfully! You can now ask questions."
+    except ValueError as e:
+        if "empty_document" in str(e):
+            return "This PDF has no readable text. It may be a scanned image. Please upload a text-based PDF."
+        return f"Failed to load PDF: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error loading PDF: {str(e)}"
 
 def chat_with_pdf(user_input, history):
     if not utils.pdf_loaded or utils.qa_chain is None:

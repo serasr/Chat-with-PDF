@@ -11,6 +11,36 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 
+# ── Error classification ──────────────────────────────────────────────────────
+class ErrorType:
+    RETRIEVAL_FAILURE = "retrieval_failure"  # no relevant chunks found
+    LLM_FAILURE       = "llm_failure"        # model timed out or empty response
+    EMPTY_DOCUMENT    = "empty_document"     # PDF had no extractable text
+    API_ERROR         = "api_error"          # Groq or other external service failed
+    UNKNOWN           = "unknown"            # catch-all
+
+
+def classify_error(error: Exception) -> str:
+    """
+    Look at the exception and decide what category it belongs to.
+    This is triage — different errors get different responses.
+    """
+    msg = str(error).lower()
+
+    if "timeout" in msg or "timed out" in msg:
+        return ErrorType.LLM_FAILURE
+
+    if "rate limit" in msg or "429" in msg:
+        return ErrorType.API_ERROR
+
+    if "connection" in msg or "api" in msg or "groq" in msg:
+        return ErrorType.API_ERROR
+
+    if "empty" in msg or "no text" in msg:
+        return ErrorType.EMPTY_DOCUMENT
+
+    return ErrorType.UNKNOWN
+
 # ── Log destinations ──────────────────────────────────────────────────────────
 LOGS_DIR   = Path("logs")
 JSONL_PATH = LOGS_DIR / "traces.jsonl"
@@ -36,7 +66,8 @@ def _init_db():
             chunks_retrieved  INTEGER,
             top_chunk_score   REAL,
             token_estimate    INTEGER,
-            error             TEXT
+            error             TEXT,
+            error_type        TEXT
         )
     """)
     con.commit()
@@ -104,38 +135,18 @@ class Trace:
         self._write()
 
     # ── Internal ──────────────────────────────────────────────────────────────
-    def _to_dict(self) -> dict:
-        return {
-            "id":            self.id,
-            "timestamp":     self.timestamp,
-            "query":         self.query,
-            "answer":        self.answer,
-            "latency_total": self.latency_total,
-            "spans": {
-                name: {
-                    "duration": s.duration,
-                    "metadata": s.metadata,
-                    "error":    s.error,
-                }
-                for name, s in self.spans.items()
-            },
-            "error": self.error,
-        }
-
     def _write(self):
         d = self._to_dict()
 
-        # 1. Append to JSONL file — one line per request
         with open(JSONL_PATH, "a") as f:
             f.write(json.dumps(d) + "\n")
 
-        # 2. Insert into SQLite
         r = self.spans.get("retrieval", Span("retrieval"))
         l = self.spans.get("llm",       Span("llm"))
 
         con = sqlite3.connect(DB_PATH)
         con.execute(
-            "INSERT OR REPLACE INTO traces VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO traces VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 d["id"],
                 d["timestamp"],
@@ -148,13 +159,39 @@ class Trace:
                 r.metadata.get("top_score"),
                 l.metadata.get("token_estimate"),
                 d["error"],
+                d.get("error_type"),
             )
         )
         con.commit()
         con.close()
-
-        # 3. Print summary to terminal
         self._print_summary()
+
+    def _to_dict(self) -> dict:
+        return {
+            "id":            self.id,
+            "timestamp":     self.timestamp,
+            "query":         self.query,
+            "answer":        self.answer,
+            "latency_total": self.latency_total,
+            "error":         self.error,
+            "error_type":    getattr(self, "error_type", None),
+            "spans": {
+                name: {
+                    "duration": s.duration,
+                    "metadata": s.metadata,
+                    "error":    s.error,
+                }
+                for name, s in self.spans.items()
+            },
+        }
+    
+    def finish(self, answer: str = None, error: str = None, error_type: str = None):
+        self.answer        = answer
+        self.error         = error
+        self.error_type    = error_type
+        self.latency_total = round(time.perf_counter() - self._start, 4)
+        self._write()
+
 
     def _print_summary(self):
         r = self.spans.get("retrieval")
