@@ -1,5 +1,3 @@
-# chain.py
-
 # ── Imports ───────────────────────────────────────────────────────────────────
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
