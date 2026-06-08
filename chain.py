@@ -1,10 +1,10 @@
-# ── Imports ───────────────────────────────────────────────────────────────────
+# Imports
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.runnables import RunnablePassthrough
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_core.retrievers import BaseRetriever
@@ -14,17 +14,19 @@ from typing import List
 from pydantic import Field
 import fitz
 from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 from tracer import Trace, classify_error, ErrorType
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# Constants
 RETRIEVAL_SCORE_THRESHOLD = 1.8
 MIN_CHUNKS_REQUIRED       = 1
-TOP_K                     = 8   # how many chunks to retrieve total
+TOP_K                     = 8
+RERANK_TOP_N              = 5
 
 load_dotenv()
 
 
-# ── PDF loader ────────────────────────────────────────────────────────────────
+# PDF loader
 def load_pdf(file_path: str) -> str:
     doc = fitz.open(file_path)
     text = ""
@@ -34,38 +36,34 @@ def load_pdf(file_path: str) -> str:
     return text
 
 
-# ── Embedding model - loaded once at startup ──────────────────────────────────
+# Models loaded once at startup
 print("Loading embedding model...")
 EMBEDDINGS = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 print("Embedding model ready.")
 
+print("Loading reranker...")
+RERANKER = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-2-v2")
+print("Reranker ready.")
 
-# ── RRF - Reciprocal Rank Fusion ──────────────────────────────────────────────
+
+# Reciprocal Rank Fusion
 def reciprocal_rank_fusion(results_list: list, k: int = 60) -> list:
     """
-    Combine multiple ranked result lists into one ranked list.
-
-    How it works:
-    - Each chunk gets a score for each list it appears in: 1/(k + rank)
-    - Scores are summed across all lists
-    - Chunks appearing in multiple lists get higher combined scores
-    - Final list is sorted by combined score
-
-    k=60 is the standard constant that smooths out rank differences.
+    Combine multiple ranked result lists into one.
+    Chunks appearing in multiple lists get higher combined scores.
+    k=60 smooths out rank position differences.
     """
     scores = {}
 
     for results in results_list:
         for rank, chunk in enumerate(results):
-            # use page_content as unique identifier for each chunk
             chunk_id = chunk.page_content
             if chunk_id not in scores:
                 scores[chunk_id] = {"score": 0.0, "chunk": chunk}
             scores[chunk_id]["score"] += 1.0 / (k + rank + 1)
 
-    # sort by combined score descending
     sorted_chunks = sorted(
         scores.values(),
         key=lambda x: x["score"],
@@ -75,23 +73,23 @@ def reciprocal_rank_fusion(results_list: list, k: int = 60) -> list:
     return [item["chunk"] for item in sorted_chunks]
 
 
-# ── Hybrid Retriever ──────────────────────────────────────────────────────────
+# Hybrid Retriever with Reranking
 class HybridRetriever(BaseRetriever):
     """
-    Combines BM25 (keyword) and FAISS (semantic) search using RRF.
+    Stage 1: BM25 (keyword) + FAISS (semantic) combined with RRF
+    Stage 2: CrossEncoder reranker picks best chunks from candidates
 
-    BM25  → finds chunks with exact keyword matches
-    FAISS → finds chunks with similar meaning
-    RRF   → combines both ranked lists into one
-
-    This fixes the core problem: semantic search alone misses
-    chunks that contain exact query terms like "abstract" or "BERTScore"
+    BM25  - finds exact keyword matches
+    FAISS - finds semantically similar chunks
+    RRF   - combines both ranked lists
+    CrossEncoder - scores each candidate against query together
     """
 
     vectorstore: object = Field(description="FAISS vectorstore")
     bm25: object        = Field(description="BM25 index")
     docs: list          = Field(description="All document chunks")
-    k: int              = Field(default=TOP_K, description="Number of results")
+    k: int              = Field(default=TOP_K)
+    rerank_top_n: int   = Field(default=RERANK_TOP_N)
 
     class Config:
         arbitrary_types_allowed = True
@@ -103,34 +101,41 @@ class HybridRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun = None
     ) -> List[Document]:
 
-        # ── BM25 retrieval ────────────────────────────────────────────
-        # tokenize query into individual words
+        # Stage 1a: BM25 retrieval
         query_tokens = query.lower().split()
-
-        # get BM25 scores for all chunks
         bm25_scores = self.bm25.get_scores(query_tokens)
-
-        # get indices of top-k chunks sorted by BM25 score
         top_bm25_indices = sorted(
             range(len(bm25_scores)),
             key=lambda i: bm25_scores[i],
             reverse=True
         )[:self.k]
-
         bm25_results = [self.docs[i] for i in top_bm25_indices]
 
-        # ── FAISS retrieval ───────────────────────────────────────────
+        # Stage 1b: FAISS retrieval
         faiss_results = self.vectorstore.similarity_search(query, k=self.k)
 
-        # ── RRF combination ───────────────────────────────────────────
+        # Stage 1c: RRF combination
         combined = reciprocal_rank_fusion([bm25_results, faiss_results])
 
-        return combined[:self.k]
+        # Stage 2: Reranking
+        if len(combined) > 0:
+            pairs = [[query, doc.page_content] for doc in combined]
+            rerank_scores = RERANKER.predict(pairs)
+
+            reranked = sorted(
+                zip(rerank_scores, combined),
+                key=lambda x: x[0],
+                reverse=True
+            )
+
+            combined = [doc for score, doc in reranked[:self.rerank_top_n]]
+
+        return combined
 
 
 def build_chain(file_path):
 
-    # ── Step 1: Load PDF ──────────────────────────────────────────────────────
+    # Step 1: Load PDF
     raw_text = load_pdf(file_path)
 
     if not raw_text or len(raw_text.strip()) < 100:
@@ -139,7 +144,7 @@ def build_chain(file_path):
             "It may be a scanned image. Try a text-based PDF."
         )
 
-    # ── Step 2: Chunk ─────────────────────────────────────────────────────────
+    # Step 2: Chunk
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=200,
@@ -147,31 +152,29 @@ def build_chain(file_path):
     )
     docs = splitter.create_documents([raw_text])
 
-    # ── Step 3: Build FAISS index ─────────────────────────────────────────────
+    # Step 3: FAISS index
     vectorstore = FAISS.from_documents(docs, EMBEDDINGS)
 
-    # ── Step 4: Build BM25 index ──────────────────────────────────────────────
-    # BM25 needs tokenized text - split each chunk into words
-    # This is the "corpus" BM25 searches over
+    # Step 4: BM25 index
     tokenized_corpus = [doc.page_content.lower().split() for doc in docs]
     bm25 = BM25Okapi(tokenized_corpus)
 
-    # ── Step 5: Create hybrid retriever ──────────────────────────────────────
-    # Combines FAISS and BM25 using RRF
+    # Step 5: Hybrid retriever with reranking
     retriever = HybridRetriever(
         vectorstore=vectorstore,
         bm25=bm25,
         docs=docs,
-        k=TOP_K
+        k=TOP_K,
+        rerank_top_n=RERANK_TOP_N
     )
 
-    # ── Step 6: LLM ───────────────────────────────────────────────────────────
+    # Step 6: LLM
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         temperature=0,
     )
 
-    # ── Step 7: Prompt ────────────────────────────────────────────────────────
+    # Step 7: Prompt
     prompt = ChatPromptTemplate.from_template("""
 You are a helpful research assistant analyzing an academic paper.
 Use the context below to answer the question as best you can.
@@ -186,11 +189,11 @@ Question:
 Answer:
 """)
 
-    # ── Helper ────────────────────────────────────────────────────────────────
+    # Helper
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
-    # ── Step 8: Build LCEL chain ──────────────────────────────────────────────
+    # Step 8: LCEL chain
     chain = (
         {
             "context":  retriever | format_docs,
@@ -201,7 +204,6 @@ Answer:
         | StrOutputParser()
     )
 
-    # store both indexes on chain for tracing
     chain._vectorstore = vectorstore
     chain._bm25        = bm25
     chain._docs        = docs
@@ -210,14 +212,18 @@ Answer:
 
 
 def traced_query(chain, query: str) -> str:
+    """
+    Run the chain with full tracing and error classification.
+    Records retrieval method, chunk counts, scores, and LLM latency.
+    """
     trace = Trace(query)
 
     try:
-        # ── Span 1: hybrid retrieval ──────────────────────────────────
+        # Span 1: hybrid retrieval + reranking
         with trace.span("retrieval") as r_span:
-            # run BM25
-            query_tokens     = query.lower().split()
-            bm25_scores      = chain._bm25.get_scores(query_tokens)
+            # BM25
+            query_tokens = query.lower().split()
+            bm25_scores = chain._bm25.get_scores(query_tokens)
             top_bm25_indices = sorted(
                 range(len(bm25_scores)),
                 key=lambda i: bm25_scores[i],
@@ -225,22 +231,36 @@ def traced_query(chain, query: str) -> str:
             )[:TOP_K]
             bm25_results = [chain._docs[i] for i in top_bm25_indices]
 
-            # run FAISS with scores for threshold check
+            # FAISS with scores for threshold check
             docs_with_scores = chain._vectorstore.similarity_search_with_score(
                 query, k=TOP_K
             )
             faiss_results = [doc for doc, score in docs_with_scores]
-            top_score     = round(float(docs_with_scores[0][1]), 4) if docs_with_scores else None
+            top_score = round(float(docs_with_scores[0][1]), 4) if docs_with_scores else None
 
-            # combine with RRF
-            combined         = reciprocal_rank_fusion([bm25_results, faiss_results])
+            # RRF
+            combined = reciprocal_rank_fusion([bm25_results, faiss_results])
+            chunks_before_rerank = len(combined)
+
+            # Reranking
+            if len(combined) > 0:
+                pairs = [[query, doc.page_content] for doc in combined]
+                rerank_scores = RERANKER.predict(pairs)
+                reranked = sorted(
+                    zip(rerank_scores, combined),
+                    key=lambda x: x[0],
+                    reverse=True
+                )
+                combined = [doc for score, doc in reranked[:RERANK_TOP_N]]
+
             chunks_retrieved = len(combined)
 
-            r_span.metadata["chunks_retrieved"] = chunks_retrieved
-            r_span.metadata["top_score"]        = top_score
-            r_span.metadata["retrieval_method"] = "hybrid_bm25_faiss_rrf"
+            r_span.metadata["chunks_before_rerank"] = chunks_before_rerank
+            r_span.metadata["chunks_retrieved"]     = chunks_retrieved
+            r_span.metadata["top_score"]            = top_score
+            r_span.metadata["retrieval_method"]     = "hybrid_bm25_faiss_rrf_reranked"
 
-        # ── Check 1: did retrieval find anything? ─────────────────────
+        # Check 1: did retrieval find anything?
         if chunks_retrieved < MIN_CHUNKS_REQUIRED:
             msg = "I couldn't find any relevant sections in the document for your question."
             trace.finish(
@@ -250,7 +270,7 @@ def traced_query(chain, query: str) -> str:
             )
             return msg
 
-        # ── Check 2: are the chunks relevant enough? ──────────────────
+        # Check 2: are chunks relevant enough?
         if top_score and top_score > RETRIEVAL_SCORE_THRESHOLD:
             msg = "Your question doesn't seem related to the document. Please ask something about the uploaded PDF."
             print(f"  [WARN] Low retrieval score: {top_score} - blocking LLM call")
@@ -261,7 +281,7 @@ def traced_query(chain, query: str) -> str:
             )
             return msg
 
-        # ── Span 2: LLM ───────────────────────────────────────────────
+        # Span 2: LLM
         with trace.span("llm") as llm_span:
             answer = chain.invoke(query)
 
