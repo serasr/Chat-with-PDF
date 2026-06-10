@@ -73,6 +73,37 @@ def reciprocal_rank_fusion(results_list: list, k: int = 60) -> list:
     return [item["chunk"] for item in sorted_chunks]
 
 
+def generate_hypothesis(query: str, llm) -> str:
+    """
+    Generate a hypothetical answer to use for retrieval.
+    
+    Instead of searching with the question, we search with a
+    hypothetical answer. This closes the semantic gap between
+    questions and answers in embedding space.
+    
+    The answer doesn't need to be correct - just plausible and
+    in the right semantic neighborhood.
+    """
+    hypothesis_prompt = f"""You are helping search an academic paper.
+    Generate a short passage (2-3 sentences) that would directly answer 
+    this question if found in an academic research paper.
+    Write the passage as if it is extracted text from the paper itself.
+    Use formal academic language. Be specific.
+
+    Question: {query}
+
+    Passage (write only the passage, no preamble):"""
+    
+    try:
+        response = llm.invoke(hypothesis_prompt)
+        # response is an AIMessage object, get the text content
+        hypothesis = response.content if hasattr(response, 'content') else str(response)
+        return hypothesis.strip()
+    except Exception:
+        # if hypothesis generation fails, fall back to original query
+        return query
+
+
 # Hybrid Retriever with Reranking
 class HybridRetriever(BaseRetriever):
     """
@@ -207,6 +238,7 @@ Answer:
     chain._vectorstore = vectorstore
     chain._bm25        = bm25
     chain._docs        = docs
+    chain._llm         = llm    
 
     return chain
 
@@ -214,14 +246,19 @@ Answer:
 def traced_query(chain, query: str) -> str:
     """
     Run the chain with full tracing and error classification.
-    Records retrieval method, chunk counts, scores, and LLM latency.
+    Uses HyDE - generates a hypothesis first, uses it for semantic search.
+    BM25 still uses original query for exact keyword matching.
     """
     trace = Trace(query)
 
     try:
-        # Span 1: hybrid retrieval + reranking
+        # Span 1: HyDE + hybrid retrieval + reranking
         with trace.span("retrieval") as r_span:
-            # BM25
+
+            # Step 1: Generate hypothesis for semantic search
+            hypothesis = generate_hypothesis(query, chain._llm)
+
+            # Step 2: BM25 on original query - keyword matching
             query_tokens = query.lower().split()
             bm25_scores = chain._bm25.get_scores(query_tokens)
             top_bm25_indices = sorted(
@@ -231,18 +268,23 @@ def traced_query(chain, query: str) -> str:
             )[:TOP_K]
             bm25_results = [chain._docs[i] for i in top_bm25_indices]
 
-            # FAISS with scores for threshold check
-            docs_with_scores = chain._vectorstore.similarity_search_with_score(
-                query, k=TOP_K
+            # Step 3: FAISS on hypothesis - semantic search
+            faiss_results_with_scores = chain._vectorstore.similarity_search_with_score(
+                hypothesis, k=TOP_K
             )
-            faiss_results = [doc for doc, score in docs_with_scores]
-            top_score = round(float(docs_with_scores[0][1]), 4) if docs_with_scores else None
+            faiss_results = [doc for doc, score in faiss_results_with_scores]
 
-            # RRF
+            # top_score uses original query for threshold check
+            original_scores = chain._vectorstore.similarity_search_with_score(
+                query, k=1
+            )
+            top_score = round(float(original_scores[0][1]), 4) if original_scores else None
+
+            # Step 4: RRF combination
             combined = reciprocal_rank_fusion([bm25_results, faiss_results])
             chunks_before_rerank = len(combined)
 
-            # Reranking
+            # Step 5: Reranking
             if len(combined) > 0:
                 pairs = [[query, doc.page_content] for doc in combined]
                 rerank_scores = RERANKER.predict(pairs)
@@ -258,7 +300,8 @@ def traced_query(chain, query: str) -> str:
             r_span.metadata["chunks_before_rerank"] = chunks_before_rerank
             r_span.metadata["chunks_retrieved"]     = chunks_retrieved
             r_span.metadata["top_score"]            = top_score
-            r_span.metadata["retrieval_method"]     = "hybrid_bm25_faiss_rrf_reranked"
+            r_span.metadata["retrieval_method"]     = "hyde_hybrid_bm25_faiss_rrf_reranked"
+            r_span.metadata["hypothesis"]           = hypothesis[:100]
 
         # Check 1: did retrieval find anything?
         if chunks_retrieved < MIN_CHUNKS_REQUIRED:
@@ -281,7 +324,7 @@ def traced_query(chain, query: str) -> str:
             )
             return msg
 
-        # Span 2: LLM
+        # Span 2: LLM answer generation
         with trace.span("llm") as llm_span:
             answer = chain.invoke(query)
 

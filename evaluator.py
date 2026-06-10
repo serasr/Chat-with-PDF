@@ -79,9 +79,15 @@ def run_evaluation(chain, test_questions: list) -> dict:
     # ── Step 3: Set up RAGAS with Groq as judge ───────────────────────────
     from ragas.run_config import RunConfig
 
+    # Keeping for baseline testing
+    #judge_llm = LangchainLLMWrapper(ChatGroq(
+    #    model="llama-3.3-70b-versatile",
+    #    temperature=0,
+    #))
+
     judge_llm = LangchainLLMWrapper(ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0,
+    model="llama-3.1-8b-instant",
+    temperature=0,
     ))
 
     judge_embeddings = LangchainEmbeddingsWrapper(
